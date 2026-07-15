@@ -1,14 +1,22 @@
 export type QueueItem = {
-  id: string;
   url: string;
   title: string;
+  description: string;
   summary: string;
-  score: number;
-  createdAt: string;
+  priorityScore: number;
+  estimatedMinutes: number;
+  reason: string;
 };
 
-export type Queue = {
+export type SavedQueue = {
   id: string;
-  name: string;
+  createdAt: string;
   items: QueueItem[];
+};
+
+export type QueueResponse = {
+  queue: QueueItem[];
+  shareId?: string;
+  shareUrl?: string;
+  createdAt?: string;
 };

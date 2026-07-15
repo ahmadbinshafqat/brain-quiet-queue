@@ -1,70 +1,51 @@
-import { QueueItem } from "./types";
+import { promises as fs } from "fs";
+import path from "path";
+import { createHash } from "crypto";
+import type { QueueItem, SavedQueue } from "./types";
 
-type PageMetadata = {
-  finalUrl: string;
-  title: string;
-  description: string;
-  textSample: string;
-  fetchOk: boolean;
-};
+const DATA_DIR = path.join(process.cwd(), ".data");
+const QUEUE_STORE = path.join(DATA_DIR, "queues.json");
 
-const DEFAULT_FETCH_TIMEOUT_MS = 4500;
-const DEFAULT_MAX_URLS = 20;
-
-const highRelevanceWords = [
-  "guide",
-  "tutorial",
-  "reference",
-  "docs",
-  "documentation",
-  "learn",
-  "how to",
-  "research",
-  "analysis",
-  "case study",
-  "best practices",
+const priorityTerms = [
+  "urgent",
   "security",
+  "incident",
   "performance",
-  "productivity"
+  "deadline",
+  "migration",
+  "release",
+  "guide",
+  "playbook",
+  "research",
+  "strategy",
+  "accessibility"
 ];
 
-const lowRelevanceWords = ["sale", "coupon", "ad", "sponsored", "newsletter", "login", "signup"];
-
-export function getMaxUrls(): number {
-  const parsed = Number.parseInt(process.env.MAX_URLS_PER_QUEUE ?? "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_URLS;
-}
-
-function getFetchTimeoutMs(): number {
-  const parsed = Number.parseInt(process.env.FETCH_TIMEOUT_MS ?? "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_FETCH_TIMEOUT_MS;
-}
-
-export function parseUrls(input: string): string[] {
-  const rawParts = input
-    .split(/[\s,]+/g)
-    .map((part) => part.trim())
+export function parseUrlInput(input: string) {
+  const tokens = input
+    .split(/[\s,]+/)
+    .map((token) => token.trim())
     .filter(Boolean);
 
-  const urls: string[] = [];
   const seen = new Set<string>();
+  const urls: string[] = [];
 
-  for (const part of rawParts) {
-    const normalized = normalizeUrl(part);
+  for (const token of tokens) {
+    const normalized = normalizeUrl(token);
     if (normalized && !seen.has(normalized)) {
       seen.add(normalized);
       urls.push(normalized);
     }
   }
 
-  return urls.slice(0, getMaxUrls());
+  return urls;
 }
 
-function normalizeUrl(value: string): string | null {
-  const candidate = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+function normalizeUrl(value: string) {
   try {
-    const url = new URL(candidate);
-    if (!url.hostname.includes(".")) return null;
+    const withProtocol = /^https?:\/\//i.test(value) ? value : `https://${value}`;
+    const url = new URL(withProtocol);
+    if (!/^https?:$/.test(url.protocol)) return null;
     url.hash = "";
     return url.toString();
   } catch {
@@ -72,189 +53,170 @@ function normalizeUrl(value: string): string | null {
   }
 }
 
-export async function buildQueueItems(urls: string[]): Promise<QueueItem[]> {
-  const items = await Promise.all(urls.map((url) => buildQueueItem(url)));
-  return items.sort((a, b) => b.score - a.score || a.title.localeCompare(b.title));
+export async function buildQueue(urls: string[]) {
+  const items = await Promise.all(urls.map(buildQueueItem));
+  return items.sort((a, b) => b.priorityScore - a.priorityScore);
 }
 
 async function buildQueueItem(url: string): Promise<QueueItem> {
-  const metadata = await fetchPageMetadata(url);
-  const title = metadata.title || titleFromUrl(metadata.finalUrl || url);
-  const summary = summarize(metadata, title);
-  const score = scoreItem(metadata, title, summary);
+  const metadata = await fetchMetadata(url);
+  const title = metadata.title || titleFromUrl(url);
+  const description = metadata.description || metadata.snippet || `A saved link from ${new URL(url).hostname}.`;
+  const summary = summarize(title, description, metadata.snippet);
+  const priorityScore = scoreItem(url, title, description, metadata.snippet);
+  const estimatedMinutes = estimateMinutes(description, metadata.snippet);
+  const reason = priorityReason(priorityScore, title, description);
 
   return {
-    id: stableId(url),
-    url: metadata.finalUrl || url,
+    url,
     title,
+    description,
     summary,
-    score,
-    createdAt: new Date().toISOString()
+    priorityScore,
+    estimatedMinutes,
+    reason
   };
 }
 
-async function fetchPageMetadata(url: string): Promise<PageMetadata> {
+async function fetchMetadata(url: string) {
+  const timeoutMs = Number.parseInt(process.env.FETCH_TIMEOUT_MS ?? "4500", 10);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), getFetchTimeoutMs());
+  const timer = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 4500);
 
   try {
     const response = await fetch(url, {
       signal: controller.signal,
-      redirect: "follow",
       headers: {
-        "user-agent": "QuietQueueBot/0.1 (+https://example.local)",
-        accept: "text/html,application/xhtml+xml"
+        "user-agent": "QuietQueue/1.0 (+https://example.local)"
       }
     });
-    const contentType = response.headers.get("content-type") ?? "";
-    const finalUrl = response.url || url;
 
-    if (!response.ok || !contentType.toLowerCase().includes("text/html")) {
-      return fallbackMetadata(finalUrl, false);
-    }
+    if (!response.ok) return {};
+
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/html")) return {};
 
     const html = await response.text();
     return {
-      finalUrl,
-      title: cleanText(extractTitle(html)),
-      description: cleanText(extractMeta(html, "description") || extractMeta(html, "og:description")),
-      textSample: cleanText(extractTextSample(html)),
-      fetchOk: true
+      title: decodeHtml(extractFirst(html, /<title[^>]*>([\s\S]*?)<\/title>/i) || extractMeta(html, "og:title")),
+      description: decodeHtml(extractMeta(html, "description") || extractMeta(html, "og:description")),
+      snippet: decodeHtml(extractFirst(html, /<h1[^>]*>([\s\S]*?)<\/h1>/i) || extractFirst(html, /<p[^>]*>([\s\S]*?)<\/p>/i))
     };
   } catch {
-    return fallbackMetadata(url, false);
+    return {};
   } finally {
     clearTimeout(timer);
   }
 }
 
-function fallbackMetadata(url: string, fetchOk: boolean): PageMetadata {
-  return {
-    finalUrl: url,
-    title: titleFromUrl(url),
-    description: "",
-    textSample: "",
-    fetchOk
-  };
-}
-
-function extractTitle(html: string): string {
-  return extractMeta(html, "og:title") || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || "";
-}
-
-function extractMeta(html: string, name: string): string {
+function extractMeta(html: string, name: string) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const patterns = [
-    new RegExp(`<meta[^>]+(?:name|property)=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
-    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:name|property)=["']${escaped}["'][^>]*>`, "i")
-  ];
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match?.[1]) return decodeEntities(match[1]);
-  }
-  return "";
+  const byName = new RegExp(`<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i");
+  const byProperty = new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i");
+  return extractFirst(html, byName) || extractFirst(html, byProperty);
 }
 
-function extractTextSample(html: string): string {
-  const heading = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || "";
-  const paragraphs = Array.from(html.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi))
-    .slice(0, 3)
-    .map((match) => match[1])
-    .join(" ");
-  return stripTags(`${heading} ${paragraphs}`).slice(0, 600);
+function extractFirst(html: string, regex: RegExp) {
+  const match = html.match(regex);
+  return match?.[1]?.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() ?? "";
 }
 
-function summarize(metadata: PageMetadata, title: string): string {
-  if (metadata.description) return truncateSentence(metadata.description, 190);
-  if (metadata.textSample) return truncateSentence(metadata.textSample, 190);
-  const host = safeHost(metadata.finalUrl);
-  if (!metadata.fetchOk) {
-    return `Could not fetch page metadata, but this appears to be a reading item from ${host}. Open it when the title looks relevant.`;
-  }
-  return `A saved reading item from ${host}: ${title}.`;
-}
-
-function scoreItem(metadata: PageMetadata, title: string, summary: string): number {
-  const text = `${title} ${summary} ${metadata.finalUrl}`.toLowerCase();
-  let score = 50;
-
-  for (const word of highRelevanceWords) {
-    if (text.includes(word)) score += 7;
-  }
-  for (const word of lowRelevanceWords) {
-    if (text.includes(word)) score -= 8;
-  }
-
-  const wordCount = `${metadata.description} ${metadata.textSample}`.split(/\s+/).filter(Boolean).length;
-  if (wordCount > 80) score -= 6;
-  if (wordCount > 180) score -= 7;
-  if (wordCount > 0 && wordCount <= 45) score += 7;
-
-  const pathDepth = new URL(metadata.finalUrl).pathname.split("/").filter(Boolean).length;
-  if (pathDepth >= 2) score += 4;
-  if (metadata.fetchOk) score += 5;
-
-  return Math.max(1, Math.min(100, Math.round(score)));
-}
-
-function titleFromUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const lastPart = parsed.pathname.split("/").filter(Boolean).pop();
-    const source = lastPart || parsed.hostname.replace(/^www\./, "");
-    return source
-      .replace(/[-_]+/g, " ")
-      .replace(/\.[a-z0-9]+$/i, "")
-      .replace(/\b\w/g, (char) => char.toUpperCase());
-  } catch {
-    return "Untitled link";
-  }
-}
-
-function cleanText(value: string): string {
-  return decodeEntities(stripTags(value))
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function stripTags(value: string): string {
-  return value
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ");
-}
-
-function decodeEntities(value: string): string {
+function decodeHtml(value = "") {
   return value
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ");
+    .trim();
 }
 
-function truncateSentence(value: string, maxLength: number): string {
-  if (value.length <= maxLength) return value;
-  const truncated = value.slice(0, maxLength - 1);
-  const sentenceEnd = Math.max(truncated.lastIndexOf(". "), truncated.lastIndexOf("! "), truncated.lastIndexOf("? "));
-  if (sentenceEnd > 80) return `${truncated.slice(0, sentenceEnd + 1)}`;
-  return `${truncated.trim()}…`;
+function titleFromUrl(url: string) {
+  const parsed = new URL(url);
+  const lastSegment = parsed.pathname.split("/").filter(Boolean).pop();
+  if (!lastSegment) return parsed.hostname.replace(/^www\./, "");
+  return lastSegment
+    .replace(/[-_]+/g, " ")
+    .replace(/\.[a-z0-9]+$/i, "")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function stableId(value: string): string {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash << 5) - hash + value.charCodeAt(i);
-    hash |= 0;
+function summarize(title: string, description: string, snippet = "") {
+  const source = [description, snippet].filter(Boolean).join(" ");
+  const clean = source.replace(/\s+/g, " ").trim();
+  if (!clean) return `Read “${title}” and capture the important follow-up.`;
+  return clean.length > 180 ? `${clean.slice(0, 177).trim()}...` : clean;
+}
+
+function scoreItem(url: string, title: string, description: string, snippet = "") {
+  const text = `${url} ${title} ${description} ${snippet}`.toLowerCase();
+  let score = 35;
+
+  for (const term of priorityTerms) {
+    if (text.includes(term)) score += 7;
   }
-  return `item_${Math.abs(hash).toString(36)}`;
+
+  if (text.includes("docs") || text.includes("developer")) score += 8;
+  if (text.includes("blog") || text.includes("newsletter")) score -= 4;
+  if (description.length > 120) score += 8;
+  if (title.length > 10 && title.length < 90) score += 5;
+
+  return Math.max(1, Math.min(100, score));
 }
 
-function safeHost(url: string): string {
+function estimateMinutes(description: string, snippet = "") {
+  const words = `${description} ${snippet}`.split(/\s+/).filter(Boolean).length;
+  return Math.max(2, Math.min(15, Math.ceil(words / 180) + 2));
+}
+
+function priorityReason(score: number, title: string, description: string) {
+  const text = `${title} ${description}`.toLowerCase();
+  const matched = priorityTerms.find((term) => text.includes(term));
+  if (matched) return `Boosted because it mentions ${matched}.`;
+  if (score >= 60) return "Likely useful because it has strong metadata and context.";
+  if (score >= 40) return "Solid follow-up item with enough context to review.";
+  return "Lower priority because limited metadata was available.";
+}
+
+export function createShareToken(queue: QueueItem[]) {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(queue.map((item) => [item.url, item.priorityScore])))
+    .update(String(Date.now()))
+    .digest("base64url");
+
+  return digest.slice(0, 10);
+}
+
+async function readStore(): Promise<Record<string, SavedQueue>> {
   try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return "the web";
+    const raw = await fs.readFile(QUEUE_STORE, "utf8");
+    return JSON.parse(raw) as Record<string, SavedQueue>;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return {};
+    throw error;
   }
+}
+
+async function writeStore(store: Record<string, SavedQueue>) {
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(QUEUE_STORE, JSON.stringify(store, null, 2), "utf8");
+}
+
+export async function saveQueue(id: string, items: QueueItem[]) {
+  const store = await readStore();
+  const savedQueue: SavedQueue = {
+    id,
+    createdAt: new Date().toISOString(),
+    items
+  };
+  store[id] = savedQueue;
+  await writeStore(store);
+  return savedQueue;
+}
+
+export async function loadSavedQueue(id: string) {
+  if (!/^[A-Za-z0-9_-]{6,32}$/.test(id)) return null;
+  const store = await readStore();
+  return store[id] ?? null;
 }
